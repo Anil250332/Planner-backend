@@ -449,6 +449,94 @@ router.post('/sessions/:id/message', optionalAuth, async (req, res) => {
   }
 });
 
+// Direct Voice message endpoint (receives base64 audio recorded by browser)
+router.post('/sessions/:id/voice-message', optionalAuth, async (req, res) => {
+  try {
+    const { audio, mimeType } = req.body;
+    if (!audio) {
+      return res.status(400).json({ error: 'Audio data is required.' });
+    }
+
+    const query = req.user
+      ? { _id: req.params.id, $or: [{ user: req.user._id }, { user: null }] }
+      : { _id: req.params.id };
+
+    const session = await ChatSession.findOne(query);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    const genAI = getAIClient();
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      systemInstruction: getSystemPrompt(session.language),
+    });
+
+    const prompt = `Listen carefully to the user's spoken audio message.
+1. Transcribe what the user said (English, Hindi, or Hinglish).
+2. As TravelAI (friendly travel assistant), answer the user warmly and helpfully.
+Return ONLY valid JSON:
+{
+  "userTranscript": "accurate transcript of user audio",
+  "reply": "your complete friendly response to the user"
+}`;
+
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          mimeType: mimeType || 'audio/webm',
+          data: audio,
+        },
+      },
+      { text: prompt },
+    ]);
+
+    let responseText = result.response.text().trim();
+    let userTranscript = 'Voice message';
+    let aiResponse = responseText;
+
+    try {
+      const cleaned = responseText.replace(/```(?:json)?\s*/g, '').replace(/```/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (parsed.reply) {
+        aiResponse = parsed.reply;
+      }
+      if (parsed.userTranscript) {
+        userTranscript = parsed.userTranscript;
+      }
+    } catch (e) {
+      // If direct text was returned
+    }
+
+    session.messages.push({ role: 'user', content: userTranscript });
+    session.messages.push({ role: 'assistant', content: aiResponse });
+
+    const planData = extractTripPlan(aiResponse);
+    if (planData) {
+      session.tripPlan = planData;
+      session.title = planData.tripTitle || session.title;
+      session.status = 'completed';
+    }
+
+    if (session.title === 'New Trip Chat' && userTranscript) {
+      session.title = userTranscript.substring(0, 50);
+    }
+
+    await session.save();
+
+    res.json({
+      success: true,
+      userTranscript,
+      reply: aiResponse,
+      tripPlan: session.tripPlan || null,
+      sessionTitle: session.title,
+    });
+  } catch (error) {
+    console.error('Voice message error:', error);
+    res.status(500).json({ error: error.message || 'Failed to process voice audio.' });
+  }
+});
+
 // Quick plan generation (form-based)
 router.post('/quick-plan', optionalAuth, async (req, res) => {
   try {
